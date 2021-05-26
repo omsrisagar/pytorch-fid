@@ -41,7 +41,10 @@ import torch
 import torchvision.transforms as TF
 from PIL import Image
 from scipy import linalg
+from scipy.spatial.distance import mahalanobis
 from torch.nn.functional import adaptive_avg_pool2d
+from pytorch_fid.utils import save_object1, read_object1
+from sklearn.preprocessing import MinMaxScaler
 
 try:
     from tqdm import tqdm
@@ -52,20 +55,6 @@ except ImportError:
 
 from pytorch_fid.inception import InceptionV3
 
-parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
-parser.add_argument('--batch-size', type=int, default=50,
-                    help='Batch size to use')
-parser.add_argument('--num-workers', type=int, default=8,
-                    help='Number of processes to use for data loading')
-parser.add_argument('--device', type=str, default=None,
-                    help='Device to use. Like cuda, cuda:0 or cpu')
-parser.add_argument('--dims', type=int, default=2048,
-                    choices=list(InceptionV3.BLOCK_INDEX_BY_DIM),
-                    help=('Dimensionality of Inception features to use. '
-                          'By default, uses pool3 features'))
-parser.add_argument('path', type=str, nargs=2,
-                    help=('Paths to the generated images or '
-                          'to .npz statistic files'))
 
 IMAGE_EXTENSIONS = {'bmp', 'jpg', 'jpeg', 'pgm', 'png', 'ppm',
                     'tif', 'tiff', 'webp'}
@@ -85,7 +74,6 @@ class ImagePathDataset(torch.utils.data.Dataset):
         if self.transforms is not None:
             img = self.transforms(img)
         return img
-
 
 def get_activations(files, model, batch_size=50, dims=2048, device='cpu', num_workers=8):
     """Calculates the activations of the pool_3 layer for all images.
@@ -114,7 +102,7 @@ def get_activations(files, model, batch_size=50, dims=2048, device='cpu', num_wo
                'Setting batch size to data size'))
         batch_size = len(files)
 
-    dataset = ImagePathDataset(files, transforms=TF.ToTensor())
+    dataset = ImagePathDataset(files, transforms=TF.Compose([TF.Resize(size=(299,299)), TF.ToTensor()])) # inceptionv3 expects 299,299 size
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=batch_size,
                                              shuffle=False,
@@ -143,6 +131,20 @@ def get_activations(files, model, batch_size=50, dims=2048, device='cpu', num_wo
         start_idx = start_idx + pred.shape[0]
 
     return pred_arr
+
+
+def calculate_mahalanobis_distance(mu1, sigma1, x1, eps=1e-6):
+    try:
+        vi = linalg.inv(sigma1)
+    except linalg.LinAlgError:
+        msg = ('Distance calculation produced singular product; '
+               'adding %s to diagonal of cov estimates') % eps
+        print(msg)
+        offset = np.eye(sigma1.shape[0]) * eps
+        sigma1 = sigma1 + offset
+        vi = linalg.inv(sigma1)
+    mahala_dist = [mahalanobis(u=x1[i,:], v=mu1, VI=vi) for i in range(len(x1))]
+    return np.array(mahala_dist)
 
 
 def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
@@ -183,7 +185,7 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     # Product might be almost singular
     covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
     if not np.isfinite(covmean).all():
-        msg = ('fid calculation produces singular product; '
+        msg = ('FID calculation produced singular product; '
                'adding %s to diagonal of cov estimates') % eps
         print(msg)
         offset = np.eye(sigma1.shape[0]) * eps
@@ -222,8 +224,13 @@ def calculate_activation_statistics(files, model, batch_size=50, dims=2048,
                the inception model.
     """
     act = get_activations(files, model, batch_size, dims, device, num_workers)
-    mu = np.mean(act, axis=0)
-    sigma = np.cov(act, rowvar=False)
+    mu = act
+    sigma = None
+    # mu = np.mean(act, axis=0)
+    # if act.shape[0] > 1:
+    #     sigma = np.cov(act, rowvar=False)
+    # else:
+    #     sigma = None
     return mu, sigma
 
 
@@ -232,9 +239,12 @@ def compute_statistics_of_path(path, model, batch_size, dims, device, num_worker
         with np.load(path) as f:
             m, s = f['mu'][:], f['sigma'][:]
     else:
-        path = pathlib.Path(path)
-        files = sorted([file for ext in IMAGE_EXTENSIONS
-                       for file in path.glob('*.{}'.format(ext))])
+        if os.path.isfile(path):
+            files = [path]
+        else:
+            path = pathlib.Path(path)
+            files = sorted([file for ext in IMAGE_EXTENSIONS
+                           for file in path.glob('*.{}'.format(ext))])
         m, s = calculate_activation_statistics(files, model, batch_size,
                                                dims, device, num_workers)
 
@@ -251,16 +261,44 @@ def calculate_fid_given_paths(paths, batch_size, device, dims, num_workers=8):
 
     model = InceptionV3([block_idx]).to(device)
 
-    m1, s1 = compute_statistics_of_path(paths[0], model, batch_size,
-                                        dims, device, num_workers)
+    # m1, s1 = compute_statistics_of_path(paths[0], model, batch_size,
+    #                                     dims, device, num_workers)
+    # s1inv = linalg.inv(s1)
+    # save_object1([m1, s1, s1inv], 'model/1a_traintestB_inv3_statistics.pkl')
+    m1, s1, s1inv = read_object1('model/1a_traintestB_inv3_statistics.pkl')
+    # exit(0)
     m2, s2 = compute_statistics_of_path(paths[1], model, batch_size,
                                         dims, device, num_workers)
-    fid_value = calculate_frechet_distance(m1, s1, m2, s2)
+    if s2 is None:
+        print('Calculating Frechet Mahalanobis Distance as only one image is given in the target domain')
+        fid_value = calculate_mahalanobis_distance(m1, s1, m2)
+    else:
+        print('Calculating Frechet Distance as group of images is for the target domain')
+        fid_value = calculate_frechet_distance(m1, s1, m2, s2)
+    save_object1(fid_value, 'model/mahala_scores_allimages.pkl')
+    scaler = MinMaxScaler(feature_range=(0,5), clip=True)
+    scaler.fit(fid_value.reshape(-1,1))
+    save_object1(scaler, 'model/mahala_score_scaler_allimages.pkl')
+    exit(0)
 
     return fid_value
 
 
 def main():
+    parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--batch-size', type=int, default=50,
+                        help='Batch size to use. Make sure the batch size matches the multiples of samples, otherwise some samples are ignored')
+    parser.add_argument('--num-workers', type=int, default=8,
+                        help='Number of processes to use for data loading')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Device to use. Like cuda, cuda:0 or cpu')
+    parser.add_argument('--dims', type=int, default=2048,
+                        choices=list(InceptionV3.BLOCK_INDEX_BY_DIM),
+                        help=('Dimensionality of Inception features to use. '
+                              'By default, uses pool3 features'))
+    parser.add_argument('path', type=str, nargs=2,
+                        help=('Paths to real and generated image(s) or '
+                              'to .npz statistic files'))
     args = parser.parse_args()
 
     if args.device is None:
@@ -273,7 +311,7 @@ def main():
                                           device,
                                           args.dims,
                                           args.num_workers)
-    print('FID: ', fid_value)
+    print('Distance: ', fid_value)
 
 
 if __name__ == '__main__':
